@@ -57,11 +57,11 @@ export default function Home() {
 
     if (selectedMode === "watch") {
       // Navigate to watch page instead of showing modal
-      router.push(`/watch/${newRoomId}`);
+      router.push(`/watch/${newRoomId}?host=true`);
       setShowRoomModal(false);
     } else if (selectedMode === "meet") {
       // Similar for meet mode
-      router.push(`/meet/${newRoomId}`);
+      router.push(`/meet/${newRoomId}?host=true`);
       setShowRoomModal(false);
     }
   };
