@@ -312,7 +312,7 @@ export default function WatchMode({
       handleSocketConnect();
 
       // Start sync interval if host
-      const interval = setInterval(sendHostSync, 10000);
+      const interval = setInterval(sendHostSync, 3000);
       setSyncInterval(interval);
     } else {
       // For guests, just show the prompt
@@ -508,12 +508,14 @@ export default function WatchMode({
       videoId: videoUrl,
       playerVars: {
         autoplay: 1,
-        controls: 1, // Hide controls, we'll use our own
-        disablekb: 1,
+        controls: 1, // Let's enable YouTube's native controls
+        disablekb: 0,
         enablejsapi: 1,
         modestbranding: 1,
         rel: 0,
         showinfo: 0,
+        playsinline: 1,
+        origin: window.location.origin, // Very important for cross-origin events
       },
       events: {
         onReady: onYouTubePlayerReady,
@@ -542,22 +544,28 @@ export default function WatchMode({
   };
 
   const onYouTubePlayerStateChange = (event) => {
+    console.log("YouTube player state changed to:", event.data);
+
+    // Don't process if we're already seeking or video is not ready
     if (!isVideoReady || isSeeking) return;
 
-    // Only respond to user actions if we're the host or room is unlocked
+    // Always track play/pause state locally
+    if (event.data === window.YT.PlayerState.PLAYING) {
+      setIsPlaying(true);
+    } else if (event.data === window.YT.PlayerState.PAUSED) {
+      setIsPlaying(false);
+    }
+
+    // Only emit events if host or room is unlocked
     if (isHost || !isLocked) {
       if (event.data === window.YT.PlayerState.PLAYING) {
-        setIsPlaying(true);
         const time = youtubePlayerRef.current.getCurrentTime();
+        console.log("Emitting PLAY event at time:", time);
         socket.emit("video-play", roomId, time);
       } else if (event.data === window.YT.PlayerState.PAUSED) {
-        setIsPlaying(false);
         const time = youtubePlayerRef.current.getCurrentTime();
+        console.log("Emitting PAUSE event at time:", time);
         socket.emit("video-pause", roomId, time);
-      } else if (event.data === window.YT.PlayerState.ENDED && loopVideo) {
-        // Restart video if loop is enabled
-        youtubePlayerRef.current.seekTo(0);
-        youtubePlayerRef.current.playVideo();
       }
     }
   };
@@ -612,6 +620,39 @@ export default function WatchMode({
       }
     });
 
+    // Force play/pause handlers
+    socket.on("force-play", (timestamp) => {
+      console.log("⚡ Received FORCE PLAY:", timestamp);
+      setIsPlaying(true);
+      setCurrentTime(timestamp);
+
+      if (youtubePlayerRef.current && isVideoReady) {
+        setIsSeeking(true);
+        youtubePlayerRef.current.seekTo(timestamp, true);
+        youtubePlayerRef.current.playVideo();
+
+        setTimeout(() => {
+          setIsSeeking(false);
+        }, 500);
+      }
+    });
+
+    socket.on("force-pause", (timestamp) => {
+      console.log("⚡ Received FORCE PAUSE:", timestamp);
+      setIsPlaying(false);
+      setCurrentTime(timestamp);
+
+      if (youtubePlayerRef.current && isVideoReady) {
+        setIsSeeking(true);
+        youtubePlayerRef.current.seekTo(timestamp, true);
+        youtubePlayerRef.current.pauseVideo();
+
+        setTimeout(() => {
+          setIsSeeking(false);
+        }, 500);
+      }
+    });
+
     // Room state updates
     socket.on("room-state-update", (stateUpdate) => {
       if (stateUpdate.users && stateUpdate.host) {
@@ -636,13 +677,25 @@ export default function WatchMode({
 
     // Video events
     socket.on("video-play", (timestamp) => {
+      console.log("Received PLAY command at time:", timestamp);
+
       setIsPlaying(true);
       setCurrentTime(timestamp);
 
+      // For guests, force the video to play
       if (youtubePlayerRef.current && isVideoReady && !isHost) {
         setIsSeeking(true);
-        youtubePlayerRef.current.seekTo(timestamp, true);
-        youtubePlayerRef.current.playVideo();
+
+        // Enforce play state even if already playing
+        const playerState = youtubePlayerRef.current.getPlayerState();
+        if (playerState !== window.YT.PlayerState.PLAYING) {
+          youtubePlayerRef.current.seekTo(timestamp, true);
+          youtubePlayerRef.current.playVideo();
+          console.log("Guest player forced to PLAY");
+        } else {
+          // Just sync time if already playing
+          youtubePlayerRef.current.seekTo(timestamp, true);
+        }
 
         setTimeout(() => {
           setIsSeeking(false);
@@ -651,13 +704,25 @@ export default function WatchMode({
     });
 
     socket.on("video-pause", (timestamp) => {
+      console.log("Received PAUSE command at time:", timestamp);
+
       setIsPlaying(false);
       setCurrentTime(timestamp);
 
+      // For guests, force the video to pause
       if (youtubePlayerRef.current && isVideoReady && !isHost) {
         setIsSeeking(true);
-        youtubePlayerRef.current.pauseVideo();
-        youtubePlayerRef.current.seekTo(timestamp, true);
+
+        // Enforce pause state even if already paused
+        const playerState = youtubePlayerRef.current.getPlayerState();
+        if (playerState !== window.YT.PlayerState.PAUSED) {
+          youtubePlayerRef.current.pauseVideo();
+          youtubePlayerRef.current.seekTo(timestamp, true);
+          console.log("Guest player forced to PAUSE");
+        } else {
+          // Just sync time if already paused
+          youtubePlayerRef.current.seekTo(timestamp, true);
+        }
 
         setTimeout(() => {
           setIsSeeking(false);
@@ -736,33 +801,38 @@ export default function WatchMode({
         setCurrentTime(syncData.currentTime);
         setIsPlaying(syncData.isPlaying);
 
-        if (
-          youtubePlayerRef.current &&
-          isVideoReady &&
-          Math.abs(
-            youtubePlayerRef.current.getCurrentTime() - syncData.currentTime
-          ) > 2
-        ) {
-          setIsSeeking(true);
-          youtubePlayerRef.current.seekTo(syncData.currentTime, true);
+        if (youtubePlayerRef.current && isVideoReady) {
+          // Calculate time difference
+          const currentPlayerTime = youtubePlayerRef.current.getCurrentTime();
+          const timeDiff = Math.abs(currentPlayerTime - syncData.currentTime);
 
-          if (
-            syncData.isPlaying &&
-            youtubePlayerRef.current.getPlayerState() !==
-              window.YT.PlayerState.PLAYING
-          ) {
-            youtubePlayerRef.current.playVideo();
-          } else if (
-            !syncData.isPlaying &&
-            youtubePlayerRef.current.getPlayerState() ===
-              window.YT.PlayerState.PLAYING
-          ) {
-            youtubePlayerRef.current.pauseVideo();
+          // If difference is more than 1 second, force sync
+          if (timeDiff > 1) {
+            console.log(
+              `Syncing time: local=${currentPlayerTime}, host=${syncData.currentTime}`
+            );
+            setIsSeeking(true);
+            youtubePlayerRef.current.seekTo(syncData.currentTime, true);
+
+            // Match play state
+            if (
+              syncData.isPlaying &&
+              youtubePlayerRef.current.getPlayerState() !==
+                window.YT.PlayerState.PLAYING
+            ) {
+              youtubePlayerRef.current.playVideo();
+            } else if (
+              !syncData.isPlaying &&
+              youtubePlayerRef.current.getPlayerState() ===
+                window.YT.PlayerState.PLAYING
+            ) {
+              youtubePlayerRef.current.pauseVideo();
+            }
+
+            setTimeout(() => {
+              setIsSeeking(false);
+            }, 500);
           }
-
-          setTimeout(() => {
-            setIsSeeking(false);
-          }, 500);
         }
       }
     });
@@ -882,12 +952,27 @@ export default function WatchMode({
   const handlePlayPause = () => {
     if (!youtubePlayerRef.current || !isVideoReady) return;
 
-    if (isPlaying) {
-      youtubePlayerRef.current.pauseVideo();
-      // Server event emitted in onYouTubePlayerStateChange
+    if (isHost || !isLocked) {
+      const currentTime = youtubePlayerRef.current.getCurrentTime();
+
+      if (isPlaying) {
+        // Manually pause and emit force event
+        youtubePlayerRef.current.pauseVideo();
+        setIsPlaying(false);
+        socket.emit("force-pause", roomId, currentTime);
+        console.log("FORCE PAUSE sent:", currentTime);
+      } else {
+        // Manually play and emit force event
+        youtubePlayerRef.current.playVideo();
+        setIsPlaying(true);
+        socket.emit("force-play", roomId, currentTime);
+        console.log("FORCE PLAY sent:", currentTime);
+      }
     } else {
-      youtubePlayerRef.current.playVideo();
-      // Server event emitted in onYouTubePlayerStateChange
+      showToast(
+        "Only the host can control playback when room is locked",
+        "error"
+      );
     }
   };
 
@@ -900,7 +985,14 @@ export default function WatchMode({
         0
       );
       youtubePlayerRef.current.seekTo(newTime, true);
-      socket.emit("video-seek", roomId, newTime);
+
+      // Force sync based on current playing state
+      if (isPlaying) {
+        socket.emit("force-play", roomId, newTime);
+      } else {
+        socket.emit("force-pause", roomId, newTime);
+      }
+      console.log("Force seek backward to:", newTime);
     } else {
       showToast("Only the host can seek when the room is locked", "error");
     }
@@ -912,7 +1004,14 @@ export default function WatchMode({
     if (isHost || !isLocked) {
       const newTime = youtubePlayerRef.current.getCurrentTime() + 10;
       youtubePlayerRef.current.seekTo(newTime, true);
-      socket.emit("video-seek", roomId, newTime);
+
+      // Force sync based on current playing state
+      if (isPlaying) {
+        socket.emit("force-play", roomId, newTime);
+      } else {
+        socket.emit("force-pause", roomId, newTime);
+      }
+      console.log("Force seek forward to:", newTime);
     } else {
       showToast("Only the host can seek when the room is locked", "error");
     }
